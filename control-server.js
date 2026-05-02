@@ -167,7 +167,18 @@ const server = http.createServer((req, res) => {
       "Access-Control-Allow-Origin": "*",
     });
 
-    let lastIndex = lastLogLineCount;
+    // Send existing log history immediately on connect
+    let lastIndex = 0;
+    if (fs.existsSync(LOG_FILE)) {
+      const content = fs.readFileSync(LOG_FILE, "utf8");
+      const lines = content.split("\n").filter((l) => l.length > 0);
+      if (lines.length > 0) {
+        const historyStart = Math.max(0, lines.length - 500);
+        const history = lines.slice(historyStart).join("\n");
+        res.write(`data: ${JSON.stringify(history)}\n\n`);
+        lastIndex = lines.length;
+      }
+    }
 
     const sendInterval = setInterval(() => {
       if (!fs.existsSync(LOG_FILE)) return;
