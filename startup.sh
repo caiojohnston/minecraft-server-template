@@ -192,5 +192,19 @@ for i in $(seq 1 15); do
   sleep 1
 done
 
+# Set port 8081 to public via GitHub API (devcontainer.json visibility is ignored for API-created codespaces)
+if [ -n "$CODESPACE_NAME" ] && [ -n "$GITHUB_TOKEN" ]; then
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PATCH \
+    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/user/codespaces/${CODESPACE_NAME}/ports/8081" \
+    -d '{"visibility":"public"}')
+  log "Port 8081 visibility → public (API status: $HTTP_CODE)"
+else
+  log "Skipping port visibility (CODESPACE_NAME or GITHUB_TOKEN not set)"
+fi
+
 # Keep script alive
 tail -f "$LOG"
