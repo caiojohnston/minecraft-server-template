@@ -415,12 +415,18 @@ fi
 if [ -f "$BORE_BIN" ]; then
   BORE_LOG="$SCRIPT_DIR/.bore.log"
 
-  # Watchdog: starts bore, detects IP, restarts if it dies
+  # Watchdog: starts bore, detects IP, restarts if it dies.
+  # Tries to reuse the same port on reconnect — players keep the same address.
   (
+    LAST_BORE_PORT=""
     while true; do
       rm -f "$SERVER_IP_FILE"
       > "$BORE_LOG"
-      "$BORE_BIN" local 25565 --to bore.pub > "$BORE_LOG" 2>&1 &
+
+      PORT_ARG=""
+      [ -n "$LAST_BORE_PORT" ] && PORT_ARG="--port $LAST_BORE_PORT"
+
+      "$BORE_BIN" local 25565 --to bore.pub $PORT_ARG > "$BORE_LOG" 2>&1 &
       BORE_PID=$!
 
       # Wait for bore to report its assigned port (up to 20s)
@@ -428,8 +434,16 @@ if [ -f "$BORE_BIN" ]; then
         sleep 1
         ADDR=$(grep -oP 'bore\.pub:\d+' "$BORE_LOG" 2>/dev/null | head -1)
         if [ -n "$ADDR" ]; then
+          NEW_PORT="${ADDR##*:}"
           echo "$ADDR" > "$SERVER_IP_FILE"
-          echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP: $ADDR — players can connect!" >> "$LOG"
+          if [ -n "$LAST_BORE_PORT" ] && [ "$NEW_PORT" != "$LAST_BORE_PORT" ]; then
+            echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP changed: $ADDR — players can connect!" >> "$LOG"
+            # Notify in-game so players see the new address in chat
+            tmux send-keys -t mc "say [MineHost] Endereco atualizado: $ADDR — reconecte-se!" C-m 2>/dev/null || true
+          else
+            echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP: $ADDR — players can connect!" >> "$LOG"
+          fi
+          LAST_BORE_PORT="$NEW_PORT"
           break
         fi
       done
@@ -441,8 +455,8 @@ if [ -f "$BORE_BIN" ]; then
       # Wait for bore process to exit
       wait $BORE_PID 2>/dev/null
       rm -f "$SERVER_IP_FILE"
-      echo "[$(date '+%H:%M:%S')] [MINEHOST] bore tunnel dropped — reconnecting in 5s..." >> "$LOG"
-      sleep 5
+      echo "[$(date '+%H:%M:%S')] [MINEHOST] bore tunnel dropped — reconnecting in 2s..." >> "$LOG"
+      sleep 2
     done
   ) &
 else
