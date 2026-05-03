@@ -158,29 +158,45 @@ case "$TYPE" in
     # Accept EULA now (before looking for start scripts)
     echo "eula=true" > "$SERVER/eula.txt"
 
+    # Run installer if pack ships forge/neoforge installer instead of server
+    # Use find instead of glob ls — more reliable across environments
+    INSTALLER=$(find "$SERVER" -maxdepth 1 \( -name "forge-*-installer.jar" -o -name "neoforge-*-installer.jar" \) 2>/dev/null | head -1)
+    if [ -n "$INSTALLER" ]; then
+      log "Running Forge/NeoForge installer: $(basename "$INSTALLER")"
+      (cd "$SERVER" && java -jar "$(basename "$INSTALLER")" --installServer >> "$LOG" 2>&1)
+      INSTALLER_EXIT=$?
+      [ $INSTALLER_EXIT -ne 0 ] && log "WARNING: Installer exited with code $INSTALLER_EXIT — continuing"
+      rm -f "$INSTALLER"
+    fi
+
     # Find start mechanism — ordered by preference
     CMD=""
     for script in run.sh start.sh startserver.sh ServerStart.sh; do
       if [ -f "$SERVER/$script" ]; then
         chmod +x "$SERVER/$script"
-        CMD="cd '$SERVER' && bash '$script' >> $LOG 2>&1"
         JAR_NAME="$script"
         break
       fi
     done
 
-    # Fallback: find server jar
-    if [ -z "$CMD" ]; then
-      FOUND_JAR=""
-      for pattern in "server.jar" "minecraft_server*.jar" "forge-*-server.jar" "neoforge-*-server.jar"; do
-        MATCH=$(ls $SERVER/$pattern 2>/dev/null | head -1)
-        if [ -n "$MATCH" ]; then FOUND_JAR="$MATCH"; break; fi
-      done
+    # Fallback: run.bat present — generate run.sh from libraries/unix_args.txt
+    if [ -z "$JAR_NAME" ] && [ -f "$SERVER/run.bat" ]; then
+      UNIX_ARGS=$(find "$SERVER/libraries" -name "unix_args.txt" 2>/dev/null | head -1)
+      if [ -n "$UNIX_ARGS" ]; then
+        log "Generating run.sh from unix_args.txt"
+        printf '#!/usr/bin/env bash\njava @user_jvm_args.txt @"%s" "$@"\n' "$UNIX_ARGS" > "$SERVER/run.sh"
+        chmod +x "$SERVER/run.sh"
+        JAR_NAME="run.sh"
+      fi
+    fi
+
+    # Fallback: find server jar directly
+    if [ -z "$JAR_NAME" ]; then
+      FOUND_JAR=$(find "$SERVER" -maxdepth 1 \( -name "server.jar" -o -name "minecraft_server*.jar" -o -name "forge-*-server.jar" -o -name "neoforge-*-server.jar" \) 2>/dev/null | head -1)
       if [ -n "$FOUND_JAR" ]; then
         JAR_NAME=$(basename "$FOUND_JAR")
-        CMD="java $JVM -jar '$FOUND_JAR' nogui >> $LOG 2>&1"
       else
-        err "No server start method found. Contents: $(ls $SERVER | head -20 | tr '\n' ' ')"
+        err "No server start method found. Contents: $(ls "$SERVER" | head -20 | tr '\n' ' ')"
         exit 1
       fi
     fi
