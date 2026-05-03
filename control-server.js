@@ -16,6 +16,11 @@ const SERVER_IP_FILE = path.join(SCRIPT_DIR, ".server_ip");
 
 // ── Utility functions ───────────────────────────────────────────────────────
 
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+function stripLine(l) {
+  return l.replace(ANSI_RE, "").replace(/\r/g, "").trim();
+}
+
 function sendToConsole(text) {
   try {
     execSync(`tmux send-keys -t mc ${JSON.stringify(text)} C-m`, {
@@ -39,14 +44,14 @@ function getServerRunning() {
 function getLastLines(n = 200) {
   if (!fs.existsSync(LOG_FILE)) return [];
   const content = fs.readFileSync(LOG_FILE, "utf8");
-  const lines = content.split("\n").filter((l) => l.length > 0);
+  const lines = content.split(/\r?\n|\r/).map(stripLine).filter((l) => l.length > 0);
   return lines.slice(-n);
 }
 
 function getLastLinesWithTotal(n = 500) {
   if (!fs.existsSync(LOG_FILE)) return { lines: [], total: 0 };
   const content = fs.readFileSync(LOG_FILE, "utf8");
-  const all = content.split("\n").filter((l) => l.length > 0);
+  const all = content.split(/\r?\n|\r/).map(stripLine).filter((l) => l.length > 0);
   return { lines: all.slice(-n), total: all.length };
 }
 
@@ -111,7 +116,7 @@ let lastLogLineCount = 0;
 function checkNewOutput() {
   if (!fs.existsSync(LOG_FILE)) return;
   const content = fs.readFileSync(LOG_FILE, "utf8");
-  const lines = content.split("\n").filter((l) => l.length > 0);
+  const lines = content.split(/\r?\n|\r/).map(stripLine).filter((l) => l.length > 0);
   if (lines.length > lastLogLineCount) {
     const newLines = lines.slice(lastLogLineCount);
     const text = newLines.join("\n") + "\n";
