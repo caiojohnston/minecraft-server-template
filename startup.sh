@@ -25,6 +25,22 @@ err() {
   echo "$msg" >&2
 }
 
+# Write startup stage to gist so the hub can show progress before logs flow
+set_stage() {
+  [ -z "${MINEHOST_GIST_ID:-}" ] || [ -z "${MINEHOST_TOKEN:-}" ] && return
+  local content="{\"stage\":\"$1\",\"running\":false,\"log\":[],\"cursor\":0}"
+  local escaped_content
+  escaped_content=$(printf '%s' "$content" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  curl -s -X PATCH "https://api.github.com/gists/$MINEHOST_GIST_ID" \
+    -H "Authorization: token $MINEHOST_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H "User-Agent: minehost-startup/1.0" \
+    -H "Content-Type: application/json" \
+    -d "{\"files\":{\"state.json\":{\"content\":\"$escaped_content\"}}}" \
+    > /dev/null 2>&1 &
+}
+
 # Returns required Java major version for a given MC version string (e.g. "1.20.1")
 mc_java_ver() {
   local minor patch
@@ -57,6 +73,7 @@ require_java() {
 }
 
 # ── Ensure dependencies ─────────────────────────────────────────────────────
+set_stage "deps"
 if ! command -v tmux &>/dev/null; then
   log "Installing tmux..."
   sudo apt-get update -qq && sudo apt-get install -y -qq tmux > /dev/null 2>&1 || err "Failed to install tmux"
@@ -118,6 +135,7 @@ fi
 # ────────────────────────────────────────
 # Download server JAR
 # ────────────────────────────────────────
+set_stage "download"
 
 case "$TYPE" in
   vanilla)
@@ -179,6 +197,7 @@ case "$TYPE" in
         VER=$(curl -sL "$FAPI/versions/game?limit=1" | jq -r '.[0].version')
       fi
       LOADER=$(curl -sL "$FAPI/versions/$VER" | jq -r '.[0].loader.version')
+      set_stage "install"
       log "Installing Fabric $VER with loader $LOADER"
       curl -sL -o fabric-installer.jar "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.1.0/fabric-installer-1.1.0.jar"
       java -jar fabric-installer.jar server -mcversion "$VER" -loader "$LOADER" -downloadMinecraft -nointeraction >> "$LOG" 2>&1
@@ -201,6 +220,7 @@ case "$TYPE" in
       else
         MC_VER="$VER"
       fi
+      set_stage "install"
       log "Installing Forge for Minecraft $MC_VER"
       JAVA_CMD=$(require_java "$(mc_java_ver "$MC_VER")")
       JAVA_MC_VER="$MC_VER"
@@ -248,6 +268,7 @@ case "$TYPE" in
         err "Download failed: $MINEHOST_CF_URL"
         exit 1
       fi
+      set_stage "install"
       log "Extracting server pack..."
       unzip -q /tmp/cfpack.zip -d "$SERVER" 2>/dev/null || { err "Failed to extract zip"; exit 1; }
       rm -f /tmp/cfpack.zip
@@ -342,6 +363,7 @@ else
   CMD="\"$JAVA_CMD\" $JVM -jar $JAR_NAME nogui >> $LOG 2>&1"
 fi
 
+set_stage "starting"
 echo "$CMD" > "$SCRIPT_DIR/.mc_cmd"
 tmux new-session -d -s mc "$CMD" || { err "Failed to create tmux session"; exit 1; }
 

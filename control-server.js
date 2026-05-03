@@ -378,6 +378,7 @@ function pushGistState() {
   const { lines: log, total: cursor } = getLastLinesWithTotal(500);
   const newState = {
     running: getServerRunning(),
+    stage: null,
     log,
     cursor,
     pending_cmd: null,
