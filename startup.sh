@@ -39,7 +39,8 @@ mc_java_ver() {
   fi
 }
 
-# Ensures Java <ver> is installed; returns path to its binary
+# Ensures Java <ver> is installed; returns path to its binary.
+# All log/err calls use >&2 so stdout stays clean for command substitution.
 require_java() {
   local need="$1"
   local current_major bin
@@ -47,9 +48,9 @@ require_java() {
   if [ "$current_major" = "$need" ]; then echo "java"; return; fi
   bin=$(find /usr/lib/jvm -maxdepth 3 -name "java" 2>/dev/null | grep -- "-${need}-" | head -1)
   if [ -z "$bin" ]; then
-    log "Java $current_major present but Java $need required — installing openjdk-${need}-jdk..."
+    log "Java $current_major present but Java $need required — installing openjdk-${need}-jdk..." >&2
     sudo apt-get install -y -qq "openjdk-${need}-jdk" > /dev/null 2>&1 \
-      || { err "Failed to install Java $need — using default Java (may fail)"; echo "java"; return; }
+      || { err "Failed to install Java $need — using default Java (may fail)" >&2; echo "java"; return; }
     bin=$(find /usr/lib/jvm -maxdepth 3 -name "java" 2>/dev/null | grep -- "-${need}-" | head -1)
   fi
   echo "${bin:-java}"
