@@ -15,6 +15,9 @@ const CONFIG_FILE = path.join(SERVER_DIR, "minehost.json");
 const SERVER_IP_FILE = path.join(SCRIPT_DIR, ".server_ip");
 const PLAYIT_CLAIM_FILE = path.join(SCRIPT_DIR, ".playit_claim");
 
+const { randomUUID } = require("crypto");
+const CMD_SECRET = process.env.MINEHOST_CMD_SECRET || randomUUID();
+
 // ── Utility functions ───────────────────────────────────────────────────────
 
 // Strips ANSI/VT escape sequences including TUI codes (cursor positioning, alt screen, etc.)
@@ -172,21 +175,33 @@ const server = http.createServer((req, res) => {
     const running = getServerRunning();
     const config = getConfig();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ running, config }));
+    res.end(JSON.stringify({
+      running,
+      config,
+      server_ip: getServerIP(),
+      playit_claim: getPlayitClaim(),
+      ram: getRam(),
+      cmd_secret: CMD_SECRET,
+    }));
     return;
   }
 
   // GET /log
   if (url.pathname === "/log" && req.method === "GET") {
-    const lines = parseInt(url.searchParams.get("lines") || "200");
-    const log = getLastLines(lines);
+    const n = parseInt(url.searchParams.get("lines") || "200");
+    const { lines: log, total } = getLastLinesWithTotal(n);
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ log }));
+    res.end(JSON.stringify({ log, total }));
     return;
   }
 
   // POST /cmd
   if (url.pathname === "/cmd" && req.method === "POST") {
+    if (req.headers["x-minehost-secret"] !== CMD_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
     let body = "";
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
@@ -243,7 +258,7 @@ const server = http.createServer((req, res) => {
     let lastIndex = 0;
     if (fs.existsSync(LOG_FILE)) {
       const content = fs.readFileSync(LOG_FILE, "utf8");
-      const lines = content.split("\n").filter((l) => l.length > 0);
+      const lines = content.split("\n").map(stripLine).filter((l) => l.length > 0);
       if (lines.length > 0) {
         const historyStart = Math.max(0, lines.length - 500);
         const history = lines.slice(historyStart).join("\n");
@@ -255,7 +270,7 @@ const server = http.createServer((req, res) => {
     const sendInterval = setInterval(() => {
       if (!fs.existsSync(LOG_FILE)) return;
       const content = fs.readFileSync(LOG_FILE, "utf8");
-      const lines = content.split("\n").filter((l) => l.length > 0);
+      const lines = content.split("\n").map(stripLine).filter((l) => l.length > 0);
       if (lines.length > lastIndex) {
         const newLines = lines.slice(lastIndex).join("\n");
         res.write(`data: ${JSON.stringify(newLines)}\n\n`);
