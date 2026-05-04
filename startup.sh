@@ -422,70 +422,183 @@ for i in $(seq 1 15); do
   sleep 1
 done
 
-# ── TCP tunnel via bore (exposes port 25565 publicly for Minecraft clients) ──
+# ── TCP tunnel via playit.gg (bore fallback if download fails) ────────────────
+PLAYIT_BIN="$SCRIPT_DIR/playit"
 BORE_BIN="$SCRIPT_DIR/bore"
 SERVER_IP_FILE="$SCRIPT_DIR/.server_ip"
-rm -f "$SERVER_IP_FILE"
+PLAYIT_CLAIM_FILE="$SCRIPT_DIR/.playit_claim"
 
-if [ ! -f "$BORE_BIN" ]; then
-  log "Downloading bore TCP tunnel..."
-  BORE_VER=$(curl -sL --connect-timeout 5 "https://api.github.com/repos/ekzhang/bore/releases/latest" \
-    | grep '"tag_name"' | grep -oP 'v\K[0-9.]+' | head -1)
-  BORE_VER="${BORE_VER:-0.5.0}"
-  curl -sL "https://github.com/ekzhang/bore/releases/download/v${BORE_VER}/bore-v${BORE_VER}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C "$SCRIPT_DIR" 2>/dev/null
-  [ -f "$BORE_BIN" ] && chmod +x "$BORE_BIN" && log "bore $BORE_VER downloaded"
+rm -f "$SERVER_IP_FILE" "$PLAYIT_CLAIM_FILE"
+
+# Download playit if not present
+if [ ! -f "$PLAYIT_BIN" ]; then
+  log "Downloading playit.gg tunnel agent..."
+  PLAYIT_VER=$(curl -sL --connect-timeout 5 \
+    "https://api.github.com/repos/playit-cloud/playit-agent/releases/latest" \
+    | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+  PLAYIT_VER="${PLAYIT_VER:-v0.17.1}"
+  if curl -sL --connect-timeout 10 --max-time 120 -L \
+    "https://github.com/playit-cloud/playit-agent/releases/download/${PLAYIT_VER}/playit-linux-amd64" \
+    -o "$PLAYIT_BIN" && [ -s "$PLAYIT_BIN" ]; then
+    chmod +x "$PLAYIT_BIN"
+    log "playit ${PLAYIT_VER} downloaded"
+  else
+    rm -f "$PLAYIT_BIN"
+    log "WARNING: playit download failed — trying bore fallback"
+  fi
 fi
 
-if [ -f "$BORE_BIN" ]; then
-  BORE_LOG="$SCRIPT_DIR/.bore.log"
+# Extracts playit tunnel public address from its log output.
+# Format: "public_addr => 127.0.0.1:25565"
+_playit_extract_addr() {
+  local logfile="$1"
+  local addr
+  addr=$(grep -oP '[a-zA-Z0-9.-]+\.(?:ply\.gg|joinmc\.link|playit\.gg):\d+' "$logfile" 2>/dev/null | head -1)
+  [ -z "$addr" ] && addr=$(grep -oP '[^\s]+(?=\s*=>\s*(?:127\.0\.0\.1|localhost):\d+)' "$logfile" 2>/dev/null | head -1)
+  echo "$addr"
+}
 
-  # Watchdog: starts bore, detects IP, restarts if it dies.
-  # Tries to reuse the same port on reconnect — players keep the same address.
+if [ -f "$PLAYIT_BIN" ] && [ -n "${MINEHOST_PLAYIT_TOKEN:-}" ]; then
+  # ── Fluxo A: token presente — túnel estático estável ────────────────────────
+  log "Starting playit.gg tunnel (authenticated)..."
+  PLAYIT_LOG="$SCRIPT_DIR/.playit.log"
   (
-    LAST_BORE_PORT=""
     while true; do
       rm -f "$SERVER_IP_FILE"
-      > "$BORE_LOG"
+      > "$PLAYIT_LOG"
+      "$PLAYIT_BIN" --secret "$MINEHOST_PLAYIT_TOKEN" > "$PLAYIT_LOG" 2>&1 &
+      PLAYIT_PID=$!
 
-      PORT_ARG=""
-      [ -n "$LAST_BORE_PORT" ] && PORT_ARG="--port $LAST_BORE_PORT"
-
-      "$BORE_BIN" local 25565 --to bore.pub $PORT_ARG > "$BORE_LOG" 2>&1 &
-      BORE_PID=$!
-
-      # Wait for bore to report its assigned port (up to 20s)
-      for i in $(seq 1 20); do
-        sleep 1
-        ADDR=$(grep -oP 'bore\.pub:\d+' "$BORE_LOG" 2>/dev/null | head -1)
+      for i in $(seq 1 30); do
+        sleep 2
+        ADDR=$(_playit_extract_addr "$PLAYIT_LOG")
         if [ -n "$ADDR" ]; then
-          NEW_PORT="${ADDR##*:}"
           echo "$ADDR" > "$SERVER_IP_FILE"
-          if [ -n "$LAST_BORE_PORT" ] && [ "$NEW_PORT" != "$LAST_BORE_PORT" ]; then
-            echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP changed: $ADDR — players can connect!" >> "$LOG"
-            # Notify in-game so players see the new address in chat
-            tmux send-keys -t mc "say [MineHost] Endereco atualizado: $ADDR — reconecte-se!" C-m 2>/dev/null || true
-          else
-            echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP: $ADDR — players can connect!" >> "$LOG"
-          fi
-          LAST_BORE_PORT="$NEW_PORT"
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] playit tunnel: $ADDR" >> "$LOG"
+          tmux send-keys -t mc "say [MineHost] Endereco: $ADDR" C-m 2>/dev/null || true
           break
         fi
       done
 
-      if [ ! -f "$SERVER_IP_FILE" ]; then
-        echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: bore did not connect in 20s — retrying..." >> "$LOG"
-      fi
+      [ ! -f "$SERVER_IP_FILE" ] && \
+        echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: playit did not connect in 60s — retrying..." >> "$LOG"
 
-      # Wait for bore process to exit
-      wait $BORE_PID 2>/dev/null
+      wait $PLAYIT_PID 2>/dev/null
       rm -f "$SERVER_IP_FILE"
-      echo "[$(date '+%H:%M:%S')] [MINEHOST] bore tunnel dropped — reconnecting in 2s..." >> "$LOG"
-      sleep 2
+      echo "[$(date '+%H:%M:%S')] [MINEHOST] playit tunnel dropped — reconnecting in 5s..." >> "$LOG"
+      sleep 5
     done
   ) &
+
+elif [ -f "$PLAYIT_BIN" ]; then
+  # ── Fluxo B: sem token — aguarda claim do usuário para ativar túnel ──────────
+  log "Starting playit.gg tunnel (unauthenticated — waiting for claim)..."
+  PLAYIT_LOG="$SCRIPT_DIR/.playit.log"
+  (
+    while true; do
+      rm -f "$SERVER_IP_FILE" "$PLAYIT_CLAIM_FILE"
+      > "$PLAYIT_LOG"
+      "$PLAYIT_BIN" > "$PLAYIT_LOG" 2>&1 &
+      PLAYIT_PID=$!
+
+      # Phase 1: wait up to 60s for claim URL or direct tunnel address
+      TUNNELED=false
+      for i in $(seq 1 60); do
+        sleep 1
+        ADDR=$(_playit_extract_addr "$PLAYIT_LOG")
+        if [ -n "$ADDR" ]; then
+          echo "$ADDR" > "$SERVER_IP_FILE"
+          rm -f "$PLAYIT_CLAIM_FILE"
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] playit tunnel: $ADDR" >> "$LOG"
+          tmux send-keys -t mc "say [MineHost] Endereco: $ADDR" C-m 2>/dev/null || true
+          TUNNELED=true
+          break
+        fi
+        CLAIM_URL=$(grep -oP 'https://playit\.gg/claim/[a-f0-9]+' "$PLAYIT_LOG" 2>/dev/null | head -1)
+        if [ -n "$CLAIM_URL" ] && [ ! -f "$PLAYIT_CLAIM_FILE" ]; then
+          echo "$CLAIM_URL" > "$PLAYIT_CLAIM_FILE"
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] playit claim URL: $CLAIM_URL" >> "$LOG"
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] Visite o link acima para ativar o tunel playit.gg" >> "$LOG"
+        fi
+      done
+
+      # Phase 2: if claim pending, keep watching until tunnel is established
+      if [ "$TUNNELED" = false ] && [ -f "$PLAYIT_CLAIM_FILE" ]; then
+        while kill -0 $PLAYIT_PID 2>/dev/null; do
+          sleep 3
+          ADDR=$(_playit_extract_addr "$PLAYIT_LOG")
+          if [ -n "$ADDR" ]; then
+            echo "$ADDR" > "$SERVER_IP_FILE"
+            rm -f "$PLAYIT_CLAIM_FILE"
+            echo "[$(date '+%H:%M:%S')] [MINEHOST] playit tunnel ativo: $ADDR" >> "$LOG"
+            tmux send-keys -t mc "say [MineHost] Endereco: $ADDR" C-m 2>/dev/null || true
+            break
+          fi
+        done
+      fi
+
+      wait $PLAYIT_PID 2>/dev/null
+      rm -f "$SERVER_IP_FILE"
+      echo "[$(date '+%H:%M:%S')] [MINEHOST] playit encerrou — reiniciando em 5s..." >> "$LOG"
+      sleep 5
+    done
+  ) &
+
 else
-  log "bore not available — no TCP tunnel (players cannot connect externally)"
+  # ── Bore fallback: playit indisponível ───────────────────────────────────────
+  if [ ! -f "$BORE_BIN" ]; then
+    log "Downloading bore TCP tunnel (playit unavailable)..."
+    BORE_VER=$(curl -sL --connect-timeout 5 "https://api.github.com/repos/ekzhang/bore/releases/latest" \
+      | grep '"tag_name"' | grep -oP 'v\K[0-9.]+' | head -1)
+    BORE_VER="${BORE_VER:-0.5.0}"
+    curl -sL "https://github.com/ekzhang/bore/releases/download/v${BORE_VER}/bore-v${BORE_VER}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C "$SCRIPT_DIR" 2>/dev/null
+    [ -f "$BORE_BIN" ] && chmod +x "$BORE_BIN" && log "bore $BORE_VER downloaded"
+  fi
+
+  if [ -f "$BORE_BIN" ]; then
+    BORE_LOG="$SCRIPT_DIR/.bore.log"
+    (
+      LAST_BORE_PORT=""
+      while true; do
+        rm -f "$SERVER_IP_FILE"
+        > "$BORE_LOG"
+
+        PORT_ARG=""
+        [ -n "$LAST_BORE_PORT" ] && PORT_ARG="--port $LAST_BORE_PORT"
+
+        "$BORE_BIN" local 25565 --to bore.pub $PORT_ARG > "$BORE_LOG" 2>&1 &
+        BORE_PID=$!
+
+        for i in $(seq 1 20); do
+          sleep 1
+          ADDR=$(grep -oP 'bore\.pub:\d+' "$BORE_LOG" 2>/dev/null | head -1)
+          if [ -n "$ADDR" ]; then
+            NEW_PORT="${ADDR##*:}"
+            echo "$ADDR" > "$SERVER_IP_FILE"
+            if [ -n "$LAST_BORE_PORT" ] && [ "$NEW_PORT" != "$LAST_BORE_PORT" ]; then
+              echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP changed: $ADDR — players can connect!" >> "$LOG"
+              tmux send-keys -t mc "say [MineHost] Endereco atualizado: $ADDR — reconecte-se!" C-m 2>/dev/null || true
+            else
+              echo "[$(date '+%H:%M:%S')] [MINEHOST] Server IP: $ADDR — players can connect!" >> "$LOG"
+            fi
+            LAST_BORE_PORT="$NEW_PORT"
+            break
+          fi
+        done
+
+        [ ! -f "$SERVER_IP_FILE" ] && \
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: bore did not connect in 20s — retrying..." >> "$LOG"
+
+        wait $BORE_PID 2>/dev/null
+        rm -f "$SERVER_IP_FILE"
+        echo "[$(date '+%H:%M:%S')] [MINEHOST] bore tunnel dropped — reconnecting in 2s..." >> "$LOG"
+        sleep 2
+      done
+    ) &
+  else
+    log "bore not available — no TCP tunnel (players cannot connect externally)"
+  fi
 fi
 
 # Keep script alive

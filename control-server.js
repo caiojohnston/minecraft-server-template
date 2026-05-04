@@ -13,6 +13,7 @@ const SERVER_DIR = process.env.SERVER_DIR || path.join(SCRIPT_DIR, "server");
 const LOG_FILE = path.join(SERVER_DIR, "server.log");
 const CONFIG_FILE = path.join(SERVER_DIR, "minehost.json");
 const SERVER_IP_FILE = path.join(SCRIPT_DIR, ".server_ip");
+const PLAYIT_CLAIM_FILE = path.join(SCRIPT_DIR, ".playit_claim");
 
 // ── Utility functions ───────────────────────────────────────────────────────
 
@@ -68,21 +69,21 @@ function setConfig(obj) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(obj, null, 2));
 }
 
-function isBoreAlive() {
-  try {
-    execSync("pgrep -x bore", { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function getServerIP() {
   try {
     if (!fs.existsSync(SERVER_IP_FILE)) return null;
-    if (!isBoreAlive()) return null;
     const ip = fs.readFileSync(SERVER_IP_FILE, "utf8").trim();
     return ip || null;
+  } catch {
+    return null;
+  }
+}
+
+function getPlayitClaim() {
+  try {
+    if (!fs.existsSync(PLAYIT_CLAIM_FILE)) return null;
+    const url = fs.readFileSync(PLAYIT_CLAIM_FILE, "utf8").trim();
+    return url || null;
   } catch {
     return null;
   }
@@ -389,6 +390,7 @@ function pushGistState() {
     pending_cmd: null,
     updated: Date.now(),
     server_ip: getServerIP(),
+    playit_claim: getPlayitClaim(),
     config: getConfig(),
     ram: getRam(),
   };
