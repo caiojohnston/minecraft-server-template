@@ -84,25 +84,55 @@ require_java() {
   echo "${bin:-java}"
 }
 
-# ── Always verify gist via GITHUB_TOKEN ─────────────────────────────────────
-# Codespace Secrets can propagate stale values from previous runs (the Secret key exists
-# but points to an old gist). GITHUB_TOKEN is always auto-injected and authoritative.
-# We unconditionally use it to find the most recently created minehost-state gist,
-# overriding whatever MINEHOST_GIST_ID the Secret may have provided.
+# ── Always discover gist via GITHUB_TOKEN ────────────────────────────────────
+# Codespace Secrets propagate stale gist IDs from previous runs. GITHUB_TOKEN is
+# always auto-injected and authoritative. We unconditionally use it to find the
+# most recently created minehost-state gist.
+# NOTE: jq may not be installed yet (installed later in deps section).
+# Use python3 as primary parser — it is always available in Codespace environments.
 if [ -n "${GITHUB_TOKEN:-}" ]; then
-  FOUND_GIST=$(curl -s \
+  _GIST_LIST=$(curl -s \
     -H "Authorization: Bearer $GITHUB_TOKEN" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "https://api.github.com/gists?per_page=100" \
-    | jq -r '[.[] | select(.description == "minehost-state")] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)
+    "https://api.github.com/gists?per_page=100" 2>/dev/null)
+
+  # python3 primary (always available), jq fallback
+  FOUND_GIST=$(echo "$_GIST_LIST" | python3 -c "
+import sys, json
+try:
+  gists = json.load(sys.stdin)
+  m = sorted([g for g in gists if g.get('description') == 'minehost-state'],
+             key=lambda g: g.get('created_at', ''), reverse=True)
+  print(m[0]['id'] if m else '')
+except Exception:
+  print('')
+" 2>/dev/null)
+
+  # jq fallback if python3 failed
+  if [ -z "$FOUND_GIST" ] && command -v jq &>/dev/null; then
+    FOUND_GIST=$(echo "$_GIST_LIST" \
+      | jq -r '[.[] | select(.description == "minehost-state")] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)
+  fi
+
+  unset _GIST_LIST
+
   if [ -n "$FOUND_GIST" ]; then
-    if [ "$FOUND_GIST" != "${MINEHOST_GIST_ID:-}" ]; then
-      log "MINEHOST_GIST_ID corrected via GITHUB_TOKEN (was stale): $FOUND_GIST"
+    # Verify the gist is actually accessible (guards against deleted stale gists)
+    _STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/gists/$FOUND_GIST" 2>/dev/null)
+    if [ "$_STATUS" = "200" ]; then
+      [ "$FOUND_GIST" != "${MINEHOST_GIST_ID:-}" ] && \
+        log "MINEHOST_GIST_ID corrected (was: ${MINEHOST_GIST_ID:-empty}): $FOUND_GIST"
+      MINEHOST_GIST_ID="$FOUND_GIST"
+      MINEHOST_TOKEN="$GITHUB_TOKEN"
+      export MINEHOST_GIST_ID MINEHOST_TOKEN
+    else
+      log "WARNING: Gist $FOUND_GIST not accessible (HTTP $_STATUS) — console sync unavailable"
     fi
-    MINEHOST_GIST_ID="$FOUND_GIST"
-    MINEHOST_TOKEN="$GITHUB_TOKEN"
-    export MINEHOST_GIST_ID MINEHOST_TOKEN
+    unset _STATUS
   else
     log "WARNING: No minehost-state gist found — console sync unavailable"
   fi
