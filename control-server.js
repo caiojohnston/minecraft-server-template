@@ -54,6 +54,23 @@ function getLastLines(n = 200) {
   return lines.slice(-n);
 }
 
+// Lines written since this control-server instance started (excludes previous sessions)
+function getSessionLines(maxLines = 500) {
+  if (!fs.existsSync(LOG_FILE)) return [];
+  try {
+    const { size } = fs.statSync(LOG_FILE);
+    const readLength = size - sessionStartOffset;
+    if (readLength <= 0) return [];
+    const fd = fs.openSync(LOG_FILE, "r");
+    const buf = Buffer.allocUnsafe(readLength);
+    fs.readSync(fd, buf, 0, readLength, sessionStartOffset);
+    fs.closeSync(fd);
+    return buf.toString("utf8").split("\n").map(stripLine).filter((l) => l.length > 0).slice(-maxLines);
+  } catch {
+    return [];
+  }
+}
+
 
 function getConfig() {
   if (!fs.existsSync(CONFIG_FILE)) return null;
@@ -123,18 +140,20 @@ function getRam() {
 // Single interval replaces both checkNewOutput (WebSocket) and SSE sendInterval.
 // Reads only new bytes each tick — O(delta) regardless of total log size.
 
-let tailOffset = 0;
-let tailSize   = 0;
-let totalLines = 0;
-let lineCarry  = "";
+let tailOffset        = 0;
+let tailSize          = 0;
+let totalLines        = 0;
+let lineCarry         = "";
+let sessionStartOffset = 0; // byte offset where this control-server instance started
 const tailListeners = new Set();
 
 // Initialize from current file state so first tick only picks up new lines
 if (fs.existsSync(LOG_FILE)) {
   try {
     const stat = fs.statSync(LOG_FILE);
-    tailSize   = stat.size;
-    tailOffset = stat.size;
+    tailSize          = stat.size;
+    tailOffset        = stat.size;
+    sessionStartOffset = stat.size; // lines before this offset are from a previous session
     const content = fs.readFileSync(LOG_FILE, "utf8");
     totalLines = content.split("\n").filter((l) => l.trim()).length;
   } catch {}
@@ -145,10 +164,11 @@ setInterval(() => {
   const { size } = fs.statSync(LOG_FILE);
 
   if (size < tailSize) {            // file truncated (server restart)
-    tailOffset = 0;
-    tailSize   = 0;
-    totalLines = 0;
-    lineCarry  = "";
+    tailOffset         = 0;
+    tailSize           = 0;
+    totalLines         = 0;
+    lineCarry          = "";
+    sessionStartOffset = 0;
   }
   if (size === tailSize) return;
   tailSize = size;
@@ -269,8 +289,8 @@ const server = http.createServer((req, res) => {
       "Access-Control-Allow-Origin": "*",
     });
 
-    // Send existing log history immediately on connect
-    const history = getLastLines(500);
+    // Send only lines from this control-server session (excludes previous-session logs)
+    const history = getSessionLines(500);
     if (history.length > 0) {
       res.write(`data: ${JSON.stringify(history.join("\n"))}\n\n`);
     }
