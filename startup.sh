@@ -69,8 +69,8 @@ require_java() {
   local need="$1"
   local current_major bin
   current_major=$(java -version 2>&1 | grep -oP '(?<=version ")\d+' | head -1)
-  # If installed Java already meets or exceeds requirement, use it — newer JVMs run older class files fine
-  if [ -n "$current_major" ] && [ "$current_major" -ge "$need" ] 2>/dev/null; then
+  # Exact match only — Forge/mods break on newer JVMs (e.g. Java 25 removes sun.misc.Unsafe APIs)
+  if [ -n "$current_major" ] && [ "$current_major" -eq "$need" ] 2>/dev/null; then
     echo "java"
     return
   fi
