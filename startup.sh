@@ -41,11 +41,19 @@ set_stage() {
     > /dev/null 2>&1 &
 }
 
-# Returns required Java major version for a given MC version string (e.g. "1.20.1")
+# Returns required Java major version for a given MC version string.
+# Handles legacy "1.X.Y" format and new calendar-based "26.X.Y" format.
 mc_java_ver() {
-  local minor patch
+  local major minor patch
+  major=$(echo "$1" | cut -d. -f1)
   minor=$(echo "$1" | cut -d. -f2)
   patch=$(echo "$1" | cut -d. -f3)
+  # New calendar versioning (MC >= 2025): major is the year, needs Java 21+
+  if [ "$major" -ge 2 ] 2>/dev/null; then
+    echo "21"
+    return
+  fi
+  # Legacy 1.X.Y versioning
   if [ "$minor" -ge 21 ] || { [ "$minor" -eq 20 ] && [ "${patch:-0}" -ge 5 ]; }; then
     echo "21"
   elif [ "$minor" -ge 17 ]; then
@@ -61,7 +69,11 @@ require_java() {
   local need="$1"
   local current_major bin
   current_major=$(java -version 2>&1 | grep -oP '(?<=version ")\d+' | head -1)
-  if [ "$current_major" = "$need" ]; then echo "java"; return; fi
+  # If installed Java already meets or exceeds requirement, use it — newer JVMs run older class files fine
+  if [ -n "$current_major" ] && [ "$current_major" -ge "$need" ] 2>/dev/null; then
+    echo "java"
+    return
+  fi
   bin=$(find /usr/lib/jvm -maxdepth 3 -name "java" 2>/dev/null | grep -- "-${need}-" | head -1)
   if [ -z "$bin" ]; then
     log "Java $current_major present but Java $need required — installing openjdk-${need}-jdk..." >&2
@@ -466,8 +478,11 @@ if [ -f "$PLAYIT_BIN" ] && [ -n "${MINEHOST_PLAYIT_TOKEN:-}" ]; then
     while true; do
       rm -f "$SERVER_IP_FILE"
       > "$PLAYIT_LOG"
-      "$PLAYIT_BIN" --secret "$MINEHOST_PLAYIT_TOKEN" > "$PLAYIT_LOG" 2>&1 &
+      SECRET_KEY="$MINEHOST_PLAYIT_TOKEN" "$PLAYIT_BIN" > "$PLAYIT_LOG" 2>&1 &
       PLAYIT_PID=$!
+      # Forward playit output to server log in real-time
+      tail -f "$PLAYIT_LOG" 2>/dev/null | sed 's/^/[playit] /' >> "$LOG" &
+      FWD_PID=$!
 
       for i in $(seq 1 30); do
         sleep 2
@@ -480,10 +495,14 @@ if [ -f "$PLAYIT_BIN" ] && [ -n "${MINEHOST_PLAYIT_TOKEN:-}" ]; then
         fi
       done
 
-      [ ! -f "$SERVER_IP_FILE" ] && \
-        echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: playit did not connect in 60s — retrying..." >> "$LOG"
+      if [ ! -f "$SERVER_IP_FILE" ]; then
+        echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: playit did not connect in 60s" >> "$LOG"
+        echo "[$(date '+%H:%M:%S')] [MINEHOST] playit log dump:" >> "$LOG"
+        cat "$PLAYIT_LOG" >> "$LOG" 2>/dev/null
+      fi
 
       wait $PLAYIT_PID 2>/dev/null
+      kill $FWD_PID 2>/dev/null || true
       rm -f "$SERVER_IP_FILE"
       echo "[$(date '+%H:%M:%S')] [MINEHOST] playit tunnel dropped — reconnecting in 5s..." >> "$LOG"
       sleep 5
@@ -500,6 +519,9 @@ elif [ -f "$PLAYIT_BIN" ]; then
       > "$PLAYIT_LOG"
       "$PLAYIT_BIN" > "$PLAYIT_LOG" 2>&1 &
       PLAYIT_PID=$!
+      # Forward playit output to server log in real-time
+      tail -f "$PLAYIT_LOG" 2>/dev/null | sed 's/^/[playit] /' >> "$LOG" &
+      FWD_PID=$!
 
       # Phase 1: wait up to 60s for claim URL or direct tunnel address
       TUNNELED=false
@@ -514,13 +536,22 @@ elif [ -f "$PLAYIT_BIN" ]; then
           TUNNELED=true
           break
         fi
-        CLAIM_URL=$(grep -oP 'https://playit\.gg/claim/[a-f0-9]+' "$PLAYIT_LOG" 2>/dev/null | head -1)
+        # Broad regex: catches https/http, with or without scheme, any alphanumeric claim code
+        CLAIM_URL=$(grep -oP '(?:https?://)?playit\.gg/claim/[a-zA-Z0-9]+' "$PLAYIT_LOG" 2>/dev/null | head -1)
         if [ -n "$CLAIM_URL" ] && [ ! -f "$PLAYIT_CLAIM_FILE" ]; then
+          # Ensure URL has scheme
+          [[ "$CLAIM_URL" != http* ]] && CLAIM_URL="https://$CLAIM_URL"
           echo "$CLAIM_URL" > "$PLAYIT_CLAIM_FILE"
           echo "[$(date '+%H:%M:%S')] [MINEHOST] playit claim URL: $CLAIM_URL" >> "$LOG"
-          echo "[$(date '+%H:%M:%S')] [MINEHOST] Visite o link acima para ativar o tunel playit.gg" >> "$LOG"
+          echo "[$(date '+%H:%M:%S')] [MINEHOST] Visite o link acima no painel do MineHost para ativar o tunel" >> "$LOG"
         fi
       done
+
+      # If nothing found, dump playit log for diagnosis
+      if [ "$TUNNELED" = false ] && [ ! -f "$PLAYIT_CLAIM_FILE" ]; then
+        echo "[$(date '+%H:%M:%S')] [MINEHOST] WARN: playit sem claim URL em 60s — log:" >> "$LOG"
+        cat "$PLAYIT_LOG" >> "$LOG" 2>/dev/null
+      fi
 
       # Phase 2: if claim pending, keep watching until tunnel is established
       if [ "$TUNNELED" = false ] && [ -f "$PLAYIT_CLAIM_FILE" ]; then
@@ -538,6 +569,7 @@ elif [ -f "$PLAYIT_BIN" ]; then
       fi
 
       wait $PLAYIT_PID 2>/dev/null
+      kill $FWD_PID 2>/dev/null || true
       rm -f "$SERVER_IP_FILE"
       echo "[$(date '+%H:%M:%S')] [MINEHOST] playit encerrou — reiniciando em 5s..." >> "$LOG"
       sleep 5
