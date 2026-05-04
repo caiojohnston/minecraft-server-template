@@ -84,29 +84,30 @@ require_java() {
   echo "${bin:-java}"
 }
 
-# ── Fallback: discover gist via GITHUB_TOKEN if Codespace Secrets didn't propagate ──
-# Secrets set via API can have a race condition — Codespace may start before they're available.
-# GITHUB_TOKEN is always auto-injected with the same scopes the user granted (including gist).
-if [ -z "${MINEHOST_GIST_ID:-}" ] || [ -z "${MINEHOST_TOKEN:-}" ]; then
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    log "Codespace Secrets unavailable — discovering gist via GITHUB_TOKEN..."
-    FOUND_GIST=$(curl -s \
-      -H "Authorization: Bearer $GITHUB_TOKEN" \
-      -H "Accept: application/vnd.github+json" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "https://api.github.com/gists" \
-      | jq -r '[.[] | select(.description == "minehost-state")] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)
-    if [ -n "$FOUND_GIST" ]; then
-      MINEHOST_GIST_ID="$FOUND_GIST"
-      MINEHOST_TOKEN="$GITHUB_TOKEN"
-      export MINEHOST_GIST_ID MINEHOST_TOKEN
-      log "Gist discovered via GITHUB_TOKEN: $MINEHOST_GIST_ID"
-    else
-      log "WARNING: Could not find minehost-state gist — console sync unavailable"
+# ── Always verify gist via GITHUB_TOKEN ─────────────────────────────────────
+# Codespace Secrets can propagate stale values from previous runs (the Secret key exists
+# but points to an old gist). GITHUB_TOKEN is always auto-injected and authoritative.
+# We unconditionally use it to find the most recently created minehost-state gist,
+# overriding whatever MINEHOST_GIST_ID the Secret may have provided.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  FOUND_GIST=$(curl -s \
+    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/gists?per_page=100" \
+    | jq -r '[.[] | select(.description == "minehost-state")] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)
+  if [ -n "$FOUND_GIST" ]; then
+    if [ "$FOUND_GIST" != "${MINEHOST_GIST_ID:-}" ]; then
+      log "MINEHOST_GIST_ID corrected via GITHUB_TOKEN (was stale): $FOUND_GIST"
     fi
+    MINEHOST_GIST_ID="$FOUND_GIST"
+    MINEHOST_TOKEN="$GITHUB_TOKEN"
+    export MINEHOST_GIST_ID MINEHOST_TOKEN
   else
-    log "WARNING: GITHUB_TOKEN not available — console sync unavailable"
+    log "WARNING: No minehost-state gist found — console sync unavailable"
   fi
+else
+  log "WARNING: GITHUB_TOKEN not available — using Codespace Secret values as-is"
 fi
 
 # ── Ensure dependencies ─────────────────────────────────────────────────────
