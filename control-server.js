@@ -423,7 +423,10 @@ function syncGist() {
             sendToConsole(cmd);
           }
         }
-        // pending_cmd already handled — clear it in the outgoing state
+        // Race fix: only clear pending_cmd if no NEW command arrived during processing.
+        // If user sent a command between our GET and PATCH, preserve it for next cycle.
+        const shouldClear = !cur.pending_cmd || cur.pending_cmd === lastHandledCmd;
+        newState.pending_cmd = shouldClear ? null : cur.pending_cmd;
       } catch {}
     }
     gistRequest("PATCH", { files: { "state.json": { content: JSON.stringify(newState) } } }, null);

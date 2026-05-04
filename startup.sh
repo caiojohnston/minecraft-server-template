@@ -154,6 +154,22 @@ else
   log "DEBUG: MINEHOST_GIST_ID=${MINEHOST_GIST_ID:-empty} GITHUB_TOKEN=${GITHUB_TOKEN:+set}"
 fi
 
+# ── Start control server (port 8081) ─────────────────────────────────────────
+# MUST start AFTER gist discovery above — control-server.js captures
+# MINEHOST_GIST_ID at startup. If started before, it uses stale/empty
+# GIST_ID and never syncs console/logs to the correct gist.
+log "Starting control server on :8081..."
+node "$CONTROL" 2>&1 &
+
+# Wait for control server to respond
+for i in $(seq 1 15); do
+  if curl -s http://localhost:8081/status > /dev/null 2>&1; then
+    log "Control server is up and responding"
+    break
+  fi
+  sleep 1
+done
+
 # ── Ensure dependencies ─────────────────────────────────────────────────────
 set_stage "deps"
 if ! command -v tmux &>/dev/null; then
@@ -465,19 +481,6 @@ fi
 
 sleep 2
 log "Server started — tmux session: mc"
-
-# ── Start control server (port 8081) ─────────────────────────────────────────
-log "Starting control server on :8081..."
-node "$CONTROL" 2>&1 &
-
-# Wait for control server to respond
-for i in $(seq 1 15); do
-  if curl -s http://localhost:8081/status > /dev/null 2>&1; then
-    log "Control server is up and responding"
-    break
-  fi
-  sleep 1
-done
 
 # ── TCP tunnel via playit.gg (bore fallback if download fails) ────────────────
 PLAYIT_BIN="$SCRIPT_DIR/playit"
