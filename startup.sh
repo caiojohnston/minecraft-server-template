@@ -84,32 +84,41 @@ require_java() {
   echo "${bin:-java}"
 }
 
-# ── Always discover gist via GITHUB_TOKEN ────────────────────────────────────
-# Codespace Secrets propagate stale gist IDs from previous runs. GITHUB_TOKEN is
-# always auto-injected and authoritative. We unconditionally use it to find the
-# most recently created minehost-state gist.
-# NOTE: jq may not be installed yet (installed later in deps section).
-# Use python3 as primary parser — it is always available in Codespace environments.
-if [ -n "${GITHUB_TOKEN:-}" ]; then
+# ── Gist discovery: fix stale MINEHOST_GIST_ID Secret ───────────────────────
+# Codespace Secrets propagate stale gist IDs from previous runs.
+# CRITICAL: GITHUB_TOKEN in Codespaces has repo scope only — NO gist access.
+# Must use MINEHOST_TOKEN (user PAT, always same value, has gist scope).
+# Fallback: gh CLI is pre-authenticated in Codespaces with the user's full token.
+# NOTE: jq not installed yet (installed later). Use python3 (always available).
+_DISCO_TOKEN="${MINEHOST_TOKEN:-}"
+if [ -z "$_DISCO_TOKEN" ] && command -v gh &>/dev/null; then
+  _DISCO_TOKEN=$(gh auth token 2>/dev/null || echo "")
+  [ -n "$_DISCO_TOKEN" ] && log "Gist discovery: using gh CLI token (MINEHOST_TOKEN not yet available)"
+fi
+
+if [ -n "$_DISCO_TOKEN" ]; then
+  log "Gist discovery: querying GitHub API..."
   _GIST_LIST=$(curl -s \
-    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "Authorization: Bearer $_DISCO_TOKEN" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/gists?per_page=100" 2>/dev/null)
 
-  # python3 primary (always available), jq fallback
+  # python3 primary (always available in Codespaces), jq fallback
   FOUND_GIST=$(echo "$_GIST_LIST" | python3 -c "
 import sys, json
 try:
   gists = json.load(sys.stdin)
-  m = sorted([g for g in gists if g.get('description') == 'minehost-state'],
-             key=lambda g: g.get('created_at', ''), reverse=True)
-  print(m[0]['id'] if m else '')
+  if not isinstance(gists, list):
+    print('')
+  else:
+    m = sorted([g for g in gists if g.get('description') == 'minehost-state'],
+               key=lambda g: g.get('created_at', ''), reverse=True)
+    print(m[0]['id'] if m else '')
 except Exception:
   print('')
 " 2>/dev/null)
 
-  # jq fallback if python3 failed
   if [ -z "$FOUND_GIST" ] && command -v jq &>/dev/null; then
     FOUND_GIST=$(echo "$_GIST_LIST" \
       | jq -r '[.[] | select(.description == "minehost-state")] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)
@@ -118,26 +127,31 @@ except Exception:
   unset _GIST_LIST
 
   if [ -n "$FOUND_GIST" ]; then
-    # Verify the gist is actually accessible (guards against deleted stale gists)
     _STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "Authorization: Bearer $_DISCO_TOKEN" \
       -H "Accept: application/vnd.github+json" \
       "https://api.github.com/gists/$FOUND_GIST" 2>/dev/null)
     if [ "$_STATUS" = "200" ]; then
       [ "$FOUND_GIST" != "${MINEHOST_GIST_ID:-}" ] && \
         log "MINEHOST_GIST_ID corrected (was: ${MINEHOST_GIST_ID:-empty}): $FOUND_GIST"
       MINEHOST_GIST_ID="$FOUND_GIST"
-      MINEHOST_TOKEN="$GITHUB_TOKEN"
+      # Only update MINEHOST_TOKEN if it was missing (Secret not propagated yet)
+      [ -z "${MINEHOST_TOKEN:-}" ] && MINEHOST_TOKEN="$_DISCO_TOKEN"
       export MINEHOST_GIST_ID MINEHOST_TOKEN
+      log "Gist sync ready: $MINEHOST_GIST_ID"
     else
-      log "WARNING: Gist $FOUND_GIST not accessible (HTTP $_STATUS) — console sync unavailable"
+      log "WARNING: Gist $FOUND_GIST not accessible (HTTP $_STATUS) — console sync may fail"
     fi
     unset _STATUS
   else
     log "WARNING: No minehost-state gist found — console sync unavailable"
+    log "DEBUG: MINEHOST_GIST_ID=${MINEHOST_GIST_ID:-empty} MINEHOST_TOKEN=${MINEHOST_TOKEN:+set}"
   fi
+
+  unset _DISCO_TOKEN
 else
-  log "WARNING: GITHUB_TOKEN not available — using Codespace Secret values as-is"
+  log "WARNING: No token for gist discovery (MINEHOST_TOKEN empty, gh not available)"
+  log "DEBUG: MINEHOST_GIST_ID=${MINEHOST_GIST_ID:-empty} GITHUB_TOKEN=${GITHUB_TOKEN:+set}"
 fi
 
 # ── Ensure dependencies ─────────────────────────────────────────────────────
