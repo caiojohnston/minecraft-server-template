@@ -37,9 +37,10 @@ mc_java_ver() {
   major=$(echo "$1" | cut -d. -f1)
   minor=$(echo "$1" | cut -d. -f2)
   patch=$(echo "$1" | cut -d. -f3)
-  # New calendar versioning (MC >= 2025): major is the year, needs Java 21+
+  # New calendar versioning (MC >= 2025): major is the year (e.g. 26 = year 2026)
+  # MC 25.x (year 2025) → Java 25; MC 26.x+ → Java 25 (until Mojang raises the bar)
   if [ "$major" -ge 2 ] 2>/dev/null; then
-    echo "21"
+    echo "25"
     return
   fi
   # Legacy 1.X.Y versioning
