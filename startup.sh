@@ -215,6 +215,18 @@ else
   [ -z "$_GH" ] && [ -x /usr/local/bin/gh ] && _GH=/usr/local/bin/gh
   [ -z "$_GH" ] && [ -x /home/codespace/.local/bin/gh ] && _GH=/home/codespace/.local/bin/gh
 
+  # Install gh CLI if not found (one-time, ~20s; persists for the life of the Codespace)
+  if [ -z "$_GH" ]; then
+    log "gh CLI not found — installing..."
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq gh 2>/dev/null
+    _GH=$(command -v gh 2>/dev/null || echo "")
+    [ -n "$_GH" ] && log "gh CLI installed: $_GH" || log "gh CLI install failed"
+  fi
+
   if [ -n "$_GH" ]; then
     if "$_GH" codespace ports visibility 8081:public -c "$CODESPACE_NAME" 2>/tmp/_gh_port.log; then
       log "Port 8081 set to public via gh CLI"
