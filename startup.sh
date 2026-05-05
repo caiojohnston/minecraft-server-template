@@ -5,6 +5,20 @@
 # Detect script directory (works anywhere)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Auto-update: pull latest template before running the rest of the script.
+# This ensures Codespaces that were created before a fix always run the
+# newest version without requiring the user to recreate the Codespace.
+if [ -d "$SCRIPT_DIR/.git" ]; then
+  _BEFORE=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+  git -C "$SCRIPT_DIR" pull --ff-only --quiet 2>/dev/null
+  _AFTER=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)
+  if [ "$_BEFORE" != "$_AFTER" ]; then
+    echo "[$(date '+%H:%M:%S')] [MINEHOST] Template updated ($_BEFORE → $_AFTER), re-executing..."
+    exec bash "$SCRIPT_DIR/startup.sh" "$@"
+  fi
+  unset _BEFORE _AFTER
+fi
+
 # Server data lives as sibling to the script
 SERVER="$SCRIPT_DIR/server"
 LOG="$SERVER/server.log"
@@ -140,8 +154,25 @@ except Exception:
     fi
     unset _STATUS
   else
-    log "WARNING: No minehost-state gist found — console sync unavailable"
-    log "DEBUG: MINEHOST_GIST_ID=${MINEHOST_GIST_ID:-empty} MINEHOST_TOKEN=${MINEHOST_TOKEN:+set}"
+    log "No minehost-state gist found — creating a new one..."
+    _NEW_GIST=$(curl -s \
+      -X POST \
+      -H "Authorization: Bearer $_DISCO_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      -d '{"description":"minehost-state","public":false,"files":{"state.json":{"content":"{}"}}}' \
+      "https://api.github.com/gists" 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null)
+    if [ -n "$_NEW_GIST" ]; then
+      MINEHOST_GIST_ID="$_NEW_GIST"
+      [ -z "${MINEHOST_TOKEN:-}" ] && MINEHOST_TOKEN="$_DISCO_TOKEN"
+      export MINEHOST_GIST_ID MINEHOST_TOKEN
+      log "Created new gist: $MINEHOST_GIST_ID"
+    else
+      log "WARNING: Failed to create gist — console sync unavailable"
+      log "DEBUG: MINEHOST_GIST_ID=${MINEHOST_GIST_ID:-empty} MINEHOST_TOKEN=${MINEHOST_TOKEN:+set}"
+    fi
+    unset _NEW_GIST
   fi
 
   unset _DISCO_TOKEN
