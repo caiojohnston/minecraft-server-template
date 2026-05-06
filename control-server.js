@@ -27,11 +27,28 @@ const CMD_SECRET = process.env.MINEHOST_CMD_SECRET || randomUUID();
 // the "console reverts to gist view" symptom of issue #2.
 
 const SESSION_FILE = path.join(SCRIPT_DIR, ".mc_session_id");
+// Sentinel file: present means the user explicitly stopped the server. The
+// health-check watchdog skips auto-restart while this exists, so clicking
+// "parar" doesn't immediately get undone by the auto-restart loop. Cleared
+// by `startMCServer()` (any explicit start counts as "I want it running").
+const INTENTIONAL_STOP_FILE = path.join(SCRIPT_DIR, ".mc_intentional_stop");
 let currentSessionId = null;
 let lastHeartbeatAt = Date.now();
 let lastSyncedCursor = 0;
 let pendingDelta = []; // log lines buffered since last successful gist PATCH
 const eventListeners = new Set(); // (event: {type, ...}) => void
+
+function setIntentionalStop() {
+  try { fs.writeFileSync(INTENTIONAL_STOP_FILE, String(Date.now())); } catch {}
+}
+
+function clearIntentionalStop() {
+  try { if (fs.existsSync(INTENTIONAL_STOP_FILE)) fs.unlinkSync(INTENTIONAL_STOP_FILE); } catch {}
+}
+
+function isIntentionalStop() {
+  return fs.existsSync(INTENTIONAL_STOP_FILE);
+}
 
 function readStoredSessionId() {
   try {
@@ -402,6 +419,11 @@ const server = http.createServer((req, res) => {
       return;
     }
     const result = clearLogs();
+    // Push the cleared state to the Gist immediately. Without this kick the
+    // next regular syncGist tick (up to 5 s away) is the first time the Gist
+    // reflects the clear — and a frontend in fallback mode would refill the
+    // panel from the stale snapshot in the meantime.
+    if (result.ok && GIST_ID && MINEHOST_TOKEN) syncGist();
     res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result));
     return;
@@ -541,6 +563,9 @@ let lastHandledCmd = null;
 // frontend's direct connection to :8081 is down).
 
 function startMCServer() {
+  // Any explicit start lifts the "intentional stop" guard — the user wants
+  // it running, regardless of whether it already is.
+  clearIntentionalStop();
   if (getServerRunning()) {
     return { ok: true, already_running: true, session_id: currentSessionId };
   }
@@ -563,6 +588,10 @@ function startMCServer() {
 }
 
 function stopMCServer({ timeoutMs = 30000 } = {}) {
+  // Mark before sending the stop — covers the entire window between now and
+  // the actual JVM exit. Without this the watchdog would auto-restart in
+  // up to 15 s after the server cleanly stopped.
+  setIntentionalStop();
   return new Promise((resolve) => {
     if (!getServerRunning()) return resolve({ ok: true, already_stopped: true });
     sendToConsole("stop");
@@ -688,6 +717,12 @@ function syncGist() {
             stopMCServer({ timeoutMs: 30000 });
           } else if (cmd === "__minehost_clear_logs__") {
             clearLogs();
+            // Rebuild the snapshot fields so the PATCH below reflects the
+            // cleared state. Otherwise we'd write the pre-clear `log` and
+            // `cursor` back to the Gist, fooling the frontend into refilling.
+            newState.log = [];
+            newState.cursor = 0;
+            newState.log_delta = { from: 0, to: 0, lines: [] };
           } else {
             sendToConsole(cmd);
           }
@@ -745,6 +780,18 @@ setInterval(() => {
 
   const running = getServerRunning();
   const cmdFile = path.join(SCRIPT_DIR, ".mc_cmd");
+
+  // External start (e.g. user attached to tmux and ran the cmd manually)
+  // counts as "user wants it running" — drop the intentional-stop guard so
+  // future crashes can auto-recover.
+  if (!lastSeenRunning && running) clearIntentionalStop();
+
+  // Skip both restart paths while the user has explicitly stopped the
+  // server. The flag is dropped by `startMCServer()`/`restartMCServer()`.
+  if (isIntentionalStop()) {
+    lastSeenRunning = running;
+    return;
+  }
 
   if (lastSeenRunning && !running && fs.existsSync(cmdFile)) {
     console.warn("[health] server stopped unexpectedly — auto-restarting");
