@@ -19,6 +19,57 @@ const STAGE_FILE = path.join(SCRIPT_DIR, ".mc_stage");
 const { randomUUID } = require("crypto");
 const CMD_SECRET = process.env.MINEHOST_CMD_SECRET || randomUUID();
 
+// ── Session/heartbeat state ─────────────────────────────────────────────────
+// `session_id` is a UUID minted whenever the MC server makes a fresh start
+// (initial spawn, restart via /server/restart, or external truncation of
+// server.log). The frontend compares it to its stored session to decide
+// between appending (same session) and clear+replay (new session) — fixes
+// the "console reverts to gist view" symptom of issue #2.
+
+const SESSION_FILE = path.join(SCRIPT_DIR, ".mc_session_id");
+let currentSessionId = null;
+let lastHeartbeatAt = Date.now();
+let lastSyncedCursor = 0;
+let pendingDelta = []; // log lines buffered since last successful gist PATCH
+const eventListeners = new Set(); // (event: {type, ...}) => void
+
+function readStoredSessionId() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      const id = fs.readFileSync(SESSION_FILE, "utf8").trim();
+      if (id) return id;
+    }
+  } catch {}
+  return null;
+}
+
+function writeStoredSessionId(id) {
+  try { fs.writeFileSync(SESSION_FILE, id || ""); } catch {}
+}
+
+function newSession() {
+  currentSessionId = randomUUID();
+  writeStoredSessionId(currentSessionId);
+  lastHeartbeatAt = Date.now();
+  lastSyncedCursor = 0;
+  pendingDelta = [];
+  console.log(`[control] new MC session ${currentSessionId}`);
+  for (const cb of eventListeners) {
+    try { cb({ type: "session", session_id: currentSessionId }); } catch {}
+  }
+  return currentSessionId;
+}
+
+function ensureSessionId() {
+  if (currentSessionId) return currentSessionId;
+  const stored = readStoredSessionId();
+  if (stored) {
+    currentSessionId = stored;
+    return stored;
+  }
+  return newSession();
+}
+
 // ── Utility functions ───────────────────────────────────────────────────────
 
 // Strips ANSI/VT escape sequences including TUI codes (cursor positioning, alt screen, etc.)
@@ -41,9 +92,25 @@ function sendToConsole(text) {
 
 function getServerRunning() {
   try {
-    execSync("tmux has-session -t mc 2>/dev/null");
+    execSync("tmux has-session -t mc 2>/dev/null", { stdio: "ignore" });
+  } catch {
+    return false;
+  }
+  // tmux session exists — verify there's a live child under the pane.
+  // If the JVM crashes the pane shell normally exits and tmux closes the
+  // session; but in rare hangs (or non-default `remain-on-exit`) the pane
+  // stays alive with no child. Treat that as dead and reap the orphan.
+  try {
+    const panePid = execSync("tmux list-panes -t mc -F '#{pane_pid}' 2>/dev/null", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!panePid) throw new Error("no pane pid");
+    execSync(`pgrep -P ${panePid} >/dev/null 2>&1`);
     return true;
   } catch {
+    console.warn("[health] tmux session 'mc' has no live child — reaping orphan");
+    try { execSync("tmux kill-session -t mc 2>/dev/null", { stdio: "ignore" }); } catch {}
     return false;
   }
 }
@@ -175,6 +242,11 @@ if (fs.existsSync(LOG_FILE)) {
   } catch {}
 }
 
+// If the server is already running when control-server boots (e.g. template
+// auto-update mid-session), reuse the persisted session_id; otherwise mint one
+// only on actual server starts (handled by truncation detection or endpoints).
+if (getServerRunning()) ensureSessionId();
+
 setInterval(() => {
   if (!fs.existsSync(LOG_FILE)) return;
   const { size } = fs.statSync(LOG_FILE);
@@ -185,6 +257,7 @@ setInterval(() => {
     totalLines         = 0;
     lineCarry          = "";
     sessionStartOffset = 0;
+    newSession();                   // truncation = a fresh server session
   }
   if (size === tailSize) return;
   tailSize = size;
@@ -203,6 +276,8 @@ setInterval(() => {
   if (newLines.length === 0) return;
 
   totalLines += newLines.length;
+  lastHeartbeatAt = Date.now();
+  for (const l of newLines) pendingDelta.push(l);
 
   // Clear startup stage once MC server reports ready
   if (fs.existsSync(STAGE_FILE) && newLines.some((l) => /Done \(/.test(l))) {
@@ -239,6 +314,9 @@ const server = http.createServer((req, res) => {
       playit_claim: getPlayitClaim(),
       ram: getRam(),
       cmd_secret: CMD_SECRET,
+      session_id: currentSessionId,
+      last_heartbeat_at: lastHeartbeatAt,
+      cursor: totalLines,
     }));
     return;
   }
@@ -274,6 +352,58 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // POST /server/start — idempotent. Spawns tmux session if not running.
+  if (url.pathname === "/server/start" && req.method === "POST") {
+    if (req.headers["x-minehost-secret"] !== CMD_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    const result = startMCServer();
+    res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  // POST /server/stop — fire-and-forget. Client polls /status to confirm.
+  if (url.pathname === "/server/stop" && req.method === "POST") {
+    if (req.headers["x-minehost-secret"] !== CMD_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    stopMCServer({ timeoutMs: 30000 }).catch((e) => console.error("[control] stop error:", e));
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, accepted: true }));
+    return;
+  }
+
+  // POST /server/restart — fire-and-forget. New session_id minted on completion.
+  if (url.pathname === "/server/restart" && req.method === "POST") {
+    if (req.headers["x-minehost-secret"] !== CMD_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    restartMCServer().catch((e) => console.error("[control] restart error:", e));
+    res.writeHead(202, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, accepted: true }));
+    return;
+  }
+
+  // POST /logs/clear — truncates server.log and resets tail reader state.
+  if (url.pathname === "/logs/clear" && req.method === "POST") {
+    if (req.headers["x-minehost-secret"] !== CMD_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    const result = clearLogs();
+    res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result));
     return;
   }
 
@@ -405,34 +535,79 @@ const GIST_ID = process.env.MINEHOST_GIST_ID;
 const MINEHOST_TOKEN = process.env.MINEHOST_TOKEN;
 let lastHandledCmd = null;
 
-function restartMCServer() {
+// ── MC server lifecycle helpers ─────────────────────────────────────────────
+// All four expose the same surface to HTTP endpoints (issue #1) and to
+// pending_cmd handlers in syncGist (so commands flow through even when the
+// frontend's direct connection to :8081 is down).
+
+function startMCServer() {
+  if (getServerRunning()) {
+    return { ok: true, already_running: true, session_id: currentSessionId };
+  }
   const cmdFile = path.join(SCRIPT_DIR, ".mc_cmd");
   if (!fs.existsSync(cmdFile)) {
-    console.error("[control] .mc_cmd not found — cannot restart");
-    return;
+    return { ok: false, error: ".mc_cmd not found — server has never been initialized" };
   }
   const cmd = fs.readFileSync(cmdFile, "utf8").trim();
-  sendToConsole("stop");
+  try {
+    execSync(`cd ${JSON.stringify(SERVER_DIR)} && tmux new-session -d -s mc ${JSON.stringify(cmd)}`, {
+      stdio: "ignore",
+      shell: "/bin/bash",
+    });
+  } catch (e) {
+    return { ok: false, error: `tmux spawn failed: ${e.message}` };
+  }
+  newSession();
+  console.log("[control] MC server started");
+  return { ok: true, session_id: currentSessionId };
+}
 
-  let waited = 0;
-  const check = setInterval(() => {
-    waited += 2;
-    if (!getServerRunning() || waited >= 30) {
-      clearInterval(check);
-      try { execSync("tmux kill-session -t mc 2>/dev/null || true", { stdio: "ignore" }); } catch {}
-      setTimeout(() => {
-        try {
-          execSync(`cd ${JSON.stringify(SERVER_DIR)} && tmux new-session -d -s mc ${JSON.stringify(cmd)}`, {
-            stdio: "ignore",
-            shell: "/bin/bash",
-          });
-          console.log("[control] MC server restarted");
-        } catch (e) {
-          console.error("[control] Restart failed:", e.message);
-        }
-      }, 2000);
+function stopMCServer({ timeoutMs = 30000 } = {}) {
+  return new Promise((resolve) => {
+    if (!getServerRunning()) return resolve({ ok: true, already_stopped: true });
+    sendToConsole("stop");
+    const start = Date.now();
+    const tick = setInterval(() => {
+      if (!getServerRunning()) {
+        clearInterval(tick);
+        return resolve({ ok: true, graceful: true, took_ms: Date.now() - start });
+      }
+      if (Date.now() - start >= timeoutMs) {
+        clearInterval(tick);
+        try { execSync("tmux kill-session -t mc 2>/dev/null", { stdio: "ignore" }); } catch {}
+        console.log("[control] MC server force-killed after stop timeout");
+        return resolve({ ok: true, forced: true, took_ms: Date.now() - start });
+      }
+    }, 1000);
+  });
+}
+
+function restartMCServer() {
+  return stopMCServer({ timeoutMs: 30000 }).then(() => new Promise((resolve) => {
+    setTimeout(() => resolve(startMCServer()), 2000);
+  }));
+}
+
+function clearLogs() {
+  try {
+    if (fs.existsSync(LOG_FILE)) fs.truncateSync(LOG_FILE, 0);
+    // Sync state with the truncate so the next tail tick sees size===tailSize
+    // and skips its own truncation path (which would mint a spurious session).
+    tailOffset = 0;
+    tailSize = 0;
+    totalLines = 0;
+    lineCarry = "";
+    sessionStartOffset = 0;
+    lastSyncedCursor = 0;
+    pendingDelta = [];
+    for (const cb of eventListeners) {
+      try { cb({ type: "cleared" }); } catch {}
     }
-  }, 2000);
+    console.log("[control] logs cleared");
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 function gistRequest(method, body, cb) {
@@ -470,17 +645,25 @@ function gistRequest(method, body, cb) {
 // Previously two separate functions (pushGistState + pollPendingCmd) each doing a GET,
 // totalling 3 API calls/3s = 60/min — too close to GitHub's 100/min secondary rate limit.
 // Now: 2 calls/5s = 24/min from this process + ~12/min from frontend = 36/min total.
+//
+// `log` is kept as a 500-line snapshot for backward compatibility with older
+// frontends. Newer clients should prefer `log_delta` + `cursor` + `session_id`
+// to avoid the visual "revert to gist" effect described in issue #2.
 function syncGist() {
   if (!GIST_ID || !MINEHOST_TOKEN) return;
   const log = getLastLines(500);
   const cursor = totalLines;
+  const deltaSnapshot = pendingDelta.slice();      // freeze the buffer for this cycle
   const newState = {
     running: getServerRunning(),
     stage: readStage(),
     log,
     cursor,
+    log_delta: { from: lastSyncedCursor, to: cursor, lines: deltaSnapshot },
     pending_cmd: null,
     updated: Date.now(),
+    session_id: currentSessionId,
+    last_heartbeat_at: lastHeartbeatAt,
     server_ip: getServerIP(),
     playit_claim: getPlayitClaim(),
     config: getConfig(),
@@ -491,12 +674,20 @@ function syncGist() {
     if (current?.files?.["state.json"]?.content) {
       try {
         const cur = JSON.parse(current.files["state.json"].content);
-        // Handle pending command in the same cycle (no separate pollPendingCmd GET)
+        // Handle pending command in the same cycle (no separate pollPendingCmd GET).
+        // Lifecycle commands (__minehost_*__) survive SSE/proxy outages — that's
+        // why the frontend mirrors every button press into pending_cmd.
         const cmd = cur.pending_cmd;
         if (cmd && cmd !== lastHandledCmd) {
           lastHandledCmd = cmd;
           if (cmd === "__minehost_restart__") {
             restartMCServer();
+          } else if (cmd === "__minehost_start__") {
+            startMCServer();
+          } else if (cmd === "__minehost_stop__") {
+            stopMCServer({ timeoutMs: 30000 });
+          } else if (cmd === "__minehost_clear_logs__") {
+            clearLogs();
           } else {
             sendToConsole(cmd);
           }
@@ -507,7 +698,16 @@ function syncGist() {
         newState.pending_cmd = shouldClear ? null : cur.pending_cmd;
       } catch {}
     }
-    gistRequest("PATCH", { files: { "state.json": { content: JSON.stringify(newState) } } }, null);
+    gistRequest("PATCH", { files: { "state.json": { content: JSON.stringify(newState) } } }, (resp) => {
+      // Advance cursor and shrink the delta buffer only if the PATCH actually
+      // landed. On transport failure we retain the buffered lines so the next
+      // cycle re-sends them — at the cost of a small overlap the frontend
+      // dedupes via cursor.
+      if (resp) {
+        lastSyncedCursor = cursor;
+        pendingDelta = pendingDelta.slice(deltaSnapshot.length);
+      }
+    });
   });
 }
 
@@ -517,3 +717,49 @@ if (GIST_ID && MINEHOST_TOKEN) {
 } else {
   console.log("[control] No MINEHOST_GIST_ID/MINEHOST_TOKEN — gist sync disabled");
 }
+
+// ── Health check + auto-restart (issue #2) ──────────────────────────────────
+// Two crash signals this watchdog reacts to:
+//   1. Server flipped from running to stopped without an explicit stop request.
+//      `getServerRunning()` already reaps orphan tmux sessions when the JVM
+//      dies, so a `true → false` transition means the server died on its own.
+//   2. tmux session is alive but the log has been silent for longer than the
+//      heartbeat threshold AND the server is past its startup stage. Catches
+//      JVM hangs where the process exists but has stopped responding.
+//
+// Disable per-server with `auto_restart: false` in minehost.json.
+
+const HEALTH_TICK_MS         = 15_000;
+const HEARTBEAT_STALE_MS     = 10 * 60 * 1000; // 10 min — generous to absorb idle MC servers
+const MIN_RESTART_INTERVAL_MS = 60_000;        // ceiling on restart frequency to avoid loops
+
+let lastSeenRunning   = false;
+let lastAutoRestartAt = 0;
+let restartInFlight   = false;
+
+setInterval(() => {
+  const cfg = getConfig();
+  if (cfg && cfg.auto_restart === false) return;
+  if (restartInFlight) return;
+  if (Date.now() - lastAutoRestartAt < MIN_RESTART_INTERVAL_MS) return;
+
+  const running = getServerRunning();
+  const cmdFile = path.join(SCRIPT_DIR, ".mc_cmd");
+
+  if (lastSeenRunning && !running && fs.existsSync(cmdFile)) {
+    console.warn("[health] server stopped unexpectedly — auto-restarting");
+    restartInFlight = true;
+    lastAutoRestartAt = Date.now();
+    const result = startMCServer();
+    restartInFlight = false;
+    if (!result.ok) console.error("[health] auto-restart failed:", result.error);
+  } else if (running && !readStage() && (Date.now() - lastHeartbeatAt) > HEARTBEAT_STALE_MS) {
+    const staleSec = Math.round((Date.now() - lastHeartbeatAt) / 1000);
+    console.warn(`[health] heartbeat stale (${staleSec}s) — restarting hung server`);
+    restartInFlight = true;
+    lastAutoRestartAt = Date.now();
+    restartMCServer().finally(() => { restartInFlight = false; });
+  }
+
+  lastSeenRunning = running;
+}, HEALTH_TICK_MS);
